@@ -24,9 +24,9 @@ double rad2deg(double x) { return x * 180 / pi(); }
 #define MAX_POINTS 50           	// Maximum number of points available to the path planner
 #define TARGET_SPEED 49.5			// Speed limit
 #define LANE_WIDTH 4				// Lane width in meters
-#define LANE_CENTER LANE_WIDTH / 2  // Center of the lane in meters
+#define LANE_CENTER (LANE_WIDTH / 2)// Center of the lane in meters
 #define LANE_CHANGE_THRESHOLD 30	// Distance between car in front that will trigger a lane change
-#define LANE_CHANGE_DIST_FRONT 40	// Required distance between car in front to allow safe lane change
+#define LANE_CHANGE_DIST_FRONT 20	// Required distance between car in front to allow safe lane change
 #define LANE_CHANGE_DIST_REAR 20	// Required distance between car behind to allow safe lane change
 #define MOVEMENT_DT 0.02			// Movement every 0.2ms
 #define ACCEL_DELTA .224  			// Acceleration/deceleration +/- 5m/s^2
@@ -249,7 +249,9 @@ int main() {
 
           	json msgJson;
 
-			// The previous path being followed by the car
+            // Begin collision detection
+
+            // The previous path being followed by the car
 			int prev_path_size = previous_path_x.size();
 
             if (prev_path_size>0) {
@@ -258,8 +260,10 @@ int main() {
 
             // Reset variables every cycle
             bool too_close = false;
-            int to_left = lane - 1;
-            int to_right = lane + 1;
+            int to_left = max(0, lane - 1);
+            int to_right = min(2, lane + 1);
+			bool lane_change_safe_flag = false;
+			int target_lane = -1;
 
             // Loop through all detected cars
             for(int i=0;i<sensor_fusion.size(); i++)
@@ -279,16 +283,15 @@ int main() {
                     // Predict the future s value of the detected car (20ms from now)
                     detected_car_s += ((double)prev_path_size * MOVEMENT_DT * detected_car_speed);
 
-                    // If the detected car will be less than 30m away from us evasive action is required. First check
+                    // If the detected car will be too close to us evasive action is required. First check
                     // if a lane change to the left is possible
                     if((detected_car_s > car_s) && (detected_car_s-car_s) < LANE_CHANGE_THRESHOLD)
                     {
 						too_close = true;
-						bool lane_change_safe_flag = false;
-						int target_lane = -1;
 
-						// Try change one lane to the left
-						if (0 <= to_left && to_left <= 2) {
+						// Try changing one lane to the left
+//                        if (0 <= to_left) {// && to_left <= 2) {
+						if (lane > to_left) {// && to_left <= 2) {
 							// We are in the center or right lane so a left lane change is possible. Now check for any
                             // cars that are too close and thus prevent that lane change
 							lane_change_safe_flag = true;
@@ -314,21 +317,23 @@ int main() {
                                     // Leave enough room in front and behind us after the lane change, if that is not possible
                                     // do not change langes
 									if ((detected_car_s_local > car_s) && ((detected_car_s_local - car_s) < LANE_CHANGE_DIST_FRONT)) {
-                                        // Do not change lanes if the detected car is ahead and too close to us after the lane change
-										if (detected_car_speed_local < ref_vel) {
+                                        // Do not change lanes if the detected car would end up too close in front
+//										if (detected_car_speed_local < ref_vel) {
 											lane_change_safe_flag = false;
-										}
+//										}
 									}
 
 									if ((detected_car_s_local < car_s) && ((car_s - detected_car_s_local) < LANE_CHANGE_DIST_REAR)) {
-                                        // Do not change lanes if the detected car is behind us and too close to us after the lane change
+                                        // Do not change lanes if the detected car would end up too close behind us
 										lane_change_safe_flag = false;
 									}
 								}
 							}
 						}
                         // If a lane change to the left is not possible try a lane change to the right
-                        else if (0 <= to_right && to_right <= 2) {
+//                        else if ((lane_change_safe_flag == false) && (/*0 <= to_right &&*/ to_right <= 2)) {
+                        else if ((lane_change_safe_flag == false) && (lane < to_right)) {
+                            std::cout << "right!!!" << std::endl;
 							lane_change_safe_flag = true;
 							target_lane = to_right;
 
@@ -351,43 +356,40 @@ int main() {
                                     // Leave enough room in front and behind us after the lane change, if that is not possible
                                     // do not change langes
                                     if ((check_car_s_local > car_s) && ((check_car_s_local - car_s) < LANE_CHANGE_DIST_FRONT)) {
-                                        // Do not change lanes if the detected car is ahead and too close to us after the lane change
-										if (check_speed_local < ref_vel){
+                                        // Do not change lanes if the detected car would end up too close in front
+//										if (check_speed_local < ref_vel){
 											lane_change_safe_flag = false;
-										}
+//										}
 									}
 
 									if ((check_car_s_local < car_s) && ((car_s - check_car_s_local) < LANE_CHANGE_DIST_REAR)) {
-                                        // Do not change lanes if the detected car is behind us and too close to us after the lane change
+                                        // Do not change lanes if the detected car would end up too close behind us
                                         lane_change_safe_flag = false;
 									}
 								}
 							}
 						}
-
-						// Effectuate any safe lane change, otherwise stay in the current lane
-						if (lane_change_safe_flag) {
-//							if (ref_vel < TARGET_SPEED) {
-//								ref_vel += ACCEL_DELTA;
-//							}
-							lane = target_lane;
-						}
                     }
                 }
             }
 
-            if (too_close)
+			// Effectuate any safe lane change
+			if (lane_change_safe_flag) {
+				lane = target_lane;
+			}
+			// Else if a lane change is not possible and the car in front is too close, slow down
+            else if (too_close)
             {
-                // Slow down a little when getting too close to a car in the same lane
                 ref_vel -= ACCEL_DELTA;
             }
+			// The current lane is clear so accelerate until the speed limit is reached
             else if(ref_vel < TARGET_SPEED)
             {
                 // Speed up if the lane is clear
                 ref_vel += ACCEL_DELTA;
             }
 
-            // end collision detection
+            // End collision detection
 
 			// Vector of way points used by the spline
 			vector<double> ptsx;
@@ -462,7 +464,7 @@ int main() {
 				next_y_vals.push_back(previous_path_y[i]);
 			}
 
-            // Calculate how to break up spline points to travel at desired reference velocity
+            // Calculate how to break up spline points to travel at the desired speed limit
 			double target_x = 30.0;
 			double target_y = s(target_x);
 			double target_dist = sqrt((target_x)*(target_x) + (target_y)*(target_y));
