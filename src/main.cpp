@@ -20,16 +20,22 @@ constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
 
-// Constants used by the planner
+// Constants used by the path planner
 #define MAX_POINTS 50           	// Maximum number of points available to the path planner
 #define TARGET_SPEED 49.5			// Speed limit
 #define LANE_WIDTH 4				// Lane width in meters
 #define LANE_CENTER (LANE_WIDTH / 2)// Center of the lane in meters
-#define LANE_CHANGE_THRESHOLD 30	// Distance between car in front that will trigger a lane change
-#define LANE_CHANGE_DIST_FRONT 20	// Required distance between car in front to allow safe lane change
-#define LANE_CHANGE_DIST_REAR 10	// Required distance between car behind to allow safe lane change
+#define LANE_CHANGE_THRESHOLD 25	// Distance between car in front that will trigger a lane change
+#define LANE_CHANGE_DIST_FRONT 30	// Required distance between car in front to allow safe lane change
+#define LANE_CHANGE_DIST_REAR 15	// Required distance between car behind to allow safe lane change
 #define MOVEMENT_DT 0.02			// Movement every 0.2ms
-#define ACCEL_DELTA .224  			// Acceleration/deceleration +/- 5m/s^2
+#define ACCEL_DELTA .3  			// Acceleration/deceleration +/- 5m/s^2
+#define POINT_SPACING 30            // Spacing in meters between path points
+#define PATH_NUMPOINTS 3            // Number of evenly spaced points to add
+#define MILESHOUR_METERSECOND 2.24  // Convert miles/hour to meters/second
+#define LANE_TWO 2                  // Rightmost lane
+#define LANE_ONE  1                 // Center lane
+#define LANE_ZERO 0                 // Leftmost lane
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -167,34 +173,37 @@ vector<double> getXY(double s, double d, vector<double> maps_s, vector<double> m
 	return {x,y};
 
 }
-// Check if a lane change to the target lane is safe
+// Check if a lane change to the target lane can be performed safely without hitting a car already in that lane
 bool safe_lane_change(vector<vector<double>> sensor_fusion, int prev_path_size, double car_s, int target_lane, double ref_vel)
 {
 	bool lane_change_safe_flag = true;
 
+    // Loop through all detected cars
 	for (int j = 0; j < sensor_fusion.size(); j++) {
-		float d = sensor_fusion[j][6];    // lane of the detected car
+		float d = sensor_fusion[j][6];                      // lane of the detected car
 
-		// Only check detected cars that are in the target lane (i.e. lane to our left)
+		// Only check detected cars that are currently in the target lane (i.e. lane to our left)
 		if (d < (LANE_CENTER + LANE_WIDTH * target_lane + LANE_CENTER) &&
 			d > (LANE_CENTER + LANE_WIDTH * target_lane - LANE_CENTER)) {
 
-			// Determine speed and position as before
+			// Determine the car's current speed and position
 			double vx = sensor_fusion[j][3];
 			double vy = sensor_fusion[j][4];
 			double detected_car_speed = sqrt(vx * vx + vy * vy);
 			double detected_car_s = sensor_fusion[j][5];
 
-			// Determine the future position of the car in our target lane
+			// Determine the car's future position (assuming it is not currently changing lanes, which may be an
+            // incorrect assumption (and thus a weakness of this approach)
 			detected_car_s += (double) prev_path_size * MOVEMENT_DT * detected_car_speed;
 
-			// Leave enough room in front and behind us after the lane change, if that is not possible
+			// Leave enough room in front and behind us after the lane change. If that is not possible
 			// do not change lanes
 			if ((detected_car_s > car_s) && ((detected_car_s - car_s) < LANE_CHANGE_DIST_FRONT))
             {
-                // Do not change lanes if the detected car would end up too close in front. Also
-                // do not change lanes if the car in the target lane is going slower than our car to avoid our
-                // car having to change lanes again immediately
+                // The detected car is IN FRONT of us (in the target lane). Do not change lanes if the detected car
+                // would end up too close in front of us. Also do not change lanes if the car in the target lane is
+                // going slower than our car to avoid our car having to change lanes again immediately in order to
+                // avoid changing lanes into the slower car
                 if (detected_car_speed < ref_vel) {
                     lane_change_safe_flag = false;
                 }
@@ -202,7 +211,8 @@ bool safe_lane_change(vector<vector<double>> sensor_fusion, int prev_path_size, 
 
             if ((detected_car_s < car_s) && ((car_s - detected_car_s) < LANE_CHANGE_DIST_REAR))
             {
-				// Do not change lanes if the detected car would end up too close behind us
+				// Do not change lanes if the detected car would end up too close BEHIND us to avoid cutting cars off
+                // and possibly running into cars going faster than us
 				lane_change_safe_flag = false;
 			}
 		}
@@ -249,7 +259,7 @@ int main() {
   }
 
 	// Lane and speed of the car at the start of the simulation
-	int lane = 1; 				// Assume the car starts in lane 1 (center lane)
+	int lane = LANE_ONE; 		// The current lane, assume the car starts in lane 1 (center lane)
     double ref_vel = 0.0;		// Start the car from standstill
 
 	h.onMessage([&ref_vel, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy, &lane](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
@@ -305,7 +315,7 @@ int main() {
             bool too_close = false;
             int to_left = lane - 1;
             int to_right = lane + 1;
-			bool lane_change_safe_flag = false;
+			bool lane_change_safe = false;
 			int target_lane = lane;
 
             // Loop through all detected cars
@@ -332,27 +342,27 @@ int main() {
 						too_close = true;
 
 						// Try changing one lane to the left (only if we are not already in the left most lane)
-                        if (to_left >= 0) {
-                            lane_change_safe_flag = true;
-							lane_change_safe_flag = safe_lane_change(sensor_fusion, prev_path_size, car_s, to_left, ref_vel);
-							if (lane_change_safe_flag)
+                        if (to_left >= LANE_ZERO) {
+                            lane_change_safe = true;
+							lane_change_safe = safe_lane_change(sensor_fusion, prev_path_size, car_s, to_left, ref_vel);
+							if (lane_change_safe)
 								target_lane = to_left;
                         }
 
                         // If a lane change to the left is not possible try a lane change to the right (only if we
                         // are not already in the rightmost lane)
-                        if ((lane_change_safe_flag == false) && (to_right <= 2)) {
-							lane_change_safe_flag = true;
-                            lane_change_safe_flag = safe_lane_change(sensor_fusion, prev_path_size, car_s, to_right, ref_vel);
-							if (lane_change_safe_flag)
+                        if ((lane_change_safe == false) && (to_right <= LANE_TWO)) {
+							lane_change_safe = true;
+                            lane_change_safe = safe_lane_change(sensor_fusion, prev_path_size, car_s, to_right, ref_vel);
+							if (lane_change_safe)
 								target_lane = to_right;
 						}
                     }
                 }
             }
 
-			// Effectuate any safe lane change
-			if (lane_change_safe_flag) {
+			// Effectuate any safe lane change and required acceleration/deceleration
+			if (lane_change_safe) {
                 cout << "change from " << lane << " to " << target_lane << endl;
 				lane = target_lane;
 			}
@@ -369,7 +379,7 @@ int main() {
 
             // End collision detection
 
-			// Vector of way points used by the spline
+            // Begin create new path code
 			vector<double> ptsx;
 			vector<double> ptsy;
 
@@ -377,57 +387,56 @@ int main() {
 			double ref_y = car_y;
 			double ref_yaw = deg2rad(car_yaw);
 
-			// If the previous path is almost empty use the car's current position as starting point
+			// If the previous path is almost empty use the car's current position as the starting point
 			if (prev_path_size < 2)
 			{
-				double prev_car_x = car_x - cos(car_yaw);
-				double prev_car_y = car_y - sin(car_yaw);
-
-				ptsx.push_back(prev_car_x);
+				ptsx.push_back(car_x - cos(car_yaw));
 				ptsx.push_back(car_x);
-
-				ptsy.push_back(prev_car_y);
+				ptsy.push_back(car_y - sin(car_yaw));
 				ptsy.push_back(car_y);
 			}
 			else
-			{	// Use the previous path's points as starting point
+			{	// Else use the previous path's last two points as the starting point
 				ref_x = previous_path_x[prev_path_size-1];
 				ref_y = previous_path_y[prev_path_size-1];
 
 				double ref_x_prev = previous_path_x[prev_path_size-2];
 				double ref_y_prev = previous_path_y[prev_path_size-2];
-				ref_yaw = atan2(ref_y-ref_y_prev, ref_x-ref_x_prev);
+				ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
 
+                // Use the two points that make the path tangent to the previous path's two end points
 				ptsx.push_back(ref_x_prev);
 				ptsx.push_back(ref_x);
-
 				ptsy.push_back(ref_y_prev);
 				ptsy.push_back(ref_y);
 			}
 
-			vector<double> next_wp0 = getXY(car_s+30, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-			vector<double> next_wp1 = getXY(car_s+60, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-			vector<double> next_wp2 = getXY(car_s+90, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            // Add evenly spaced points to the starting point
+            for (int i=1; i <= PATH_NUMPOINTS; i++) {
+                // get x and y coordinates based on transformations of {s, d} coordinates.
+                vector<double> xy_temp = getXY(car_s + POINT_SPACING * i, (LANE_CENTER + LANE_WIDTH * lane),
+                                            map_waypoints_s, map_waypoints_x, map_waypoints_y);
 
-			ptsx.push_back(next_wp0[0]);
-			ptsx.push_back(next_wp1[0]);
-			ptsx.push_back(next_wp2[0]);
+                ptsx.push_back(xy_temp[0]);
+                ptsy.push_back(xy_temp[1]);
+            }
 
-			ptsy.push_back(next_wp0[1]);
-			ptsy.push_back(next_wp1[1]);
-			ptsy.push_back(next_wp2[1]);
+            // ptsx and ptsy now hold the last two points plus PATH_NUMPOINTS evenly spaced points in GLOBAL coordinates
 
-            // Shift and rotate car reference angle to zero degrees to make the math easier
+            // Convert the ptsx and ptsy vectors from global to local car coordinates. Shift and rotate car reference
+            // angle to zero degrees to make the math easier
 			for (int i = 0; i < ptsx.size(); i++)
 			{
-				double shift_x = ptsx[i]-ref_x;
-				double shift_y = ptsy[i]-ref_y;
+				double shift_x = ptsx[i] - ref_x;
+				double shift_y = ptsy[i] - ref_y;
 
-				ptsx[i] = (shift_x * cos(0-ref_yaw) - shift_y*sin(0-ref_yaw));
-				ptsy[i] = (shift_x * sin(0-ref_yaw) + shift_y*cos(0-ref_yaw));
+				ptsx[i] = (shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw));
+				ptsy[i] = (shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw));
 			}
 
-            // Path planner points
+            // ptsx and ptsy now hold the last two points plus PATH_NUMPOINTS evenly spaced points in LOCAL coordinates
+
+            // Points to be used by the path planner
             vector<double> next_x_vals;
             vector<double> next_y_vals;
 
@@ -435,7 +444,7 @@ int main() {
 			tk::spline s;
 			s.set_points(ptsx, ptsy);
 
-            // Start with all the previous path planner points
+            // Start the new path with all the previous path points that have not yet been used
 			for(int i = 0;i<previous_path_x.size();i++)
 			{
 				next_x_vals.push_back(previous_path_x[i]);
@@ -443,33 +452,32 @@ int main() {
 			}
 
             // Calculate how to break up spline points to travel at the desired speed limit
-			double target_x = 30.0;
-			double target_y = s(target_x);
+			double target_x = POINT_SPACING;
+			double target_y = s(target_x);  // ask the spline for the y coordinate
 			double target_dist = sqrt((target_x)*(target_x) + (target_y)*(target_y));
-			double x_add_on = 0;
+			double x_add_on = 0;            // origin
+
+            // N is the number of points along the lane converted from miles/hour to m/s
+            double N = (target_dist / (MOVEMENT_DT * ref_vel/MILESHOUR_METERSECOND));
 
             // Add path planner points until MAX_POINTS points are ready
-			for(int i = 1;i<=MAX_POINTS-previous_path_x.size(); i++){
-				double N = (target_dist / (MOVEMENT_DT * ref_vel/2.24));
-				double x_point = x_add_on+(target_x)/N;
-				double y_point = s(x_point);
+			for(int i = 1;i <= MAX_POINTS - previous_path_x.size(); i++){
+				double x_point = x_add_on + target_x / N;
+				double y_point = s(x_point);        // ask the spline for the y coordinate
 
 				x_add_on = x_point;
-
-				double x_ref = x_point;
+                double x_ref = x_point;
 				double y_ref = y_point;
 
-                // Rotate and shift back
-				x_point = (x_ref *cos(ref_yaw)-y_ref*sin(ref_yaw));
-				y_point = (x_ref *sin(ref_yaw)+y_ref*cos(ref_yaw));
+                // Rotate and shift back to global coordinates
+				x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw)) + ref_x;
+				y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw)) + ref_y;
 
-				x_point += ref_x;
-				y_point += ref_y;
-
+                // Add the points to the new path and continue with the next
 				next_x_vals.push_back(x_point);
 				next_y_vals.push_back(y_point);
 			}
-            // end path planner code
+            // End create new path code
 
 			msgJson["next_x"] = next_x_vals;
 			msgJson["next_y"] = next_y_vals;
